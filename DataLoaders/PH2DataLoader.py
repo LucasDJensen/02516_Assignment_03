@@ -3,7 +3,7 @@ from glob import glob
 from typing import Callable, Optional, Tuple, List, Literal
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from PIL import Image
 import torchvision.transforms as T
 
@@ -168,11 +168,56 @@ class PH2Dataset(Dataset):
                        {"image": item["image"], "lesion": item["lesion"], "roi": item["roi"]})
             return out
 
+def build_dataloaders(
+    root: str,                      # path to the DRIVE root (folder that contains "training")
+    batch_size: int = 4,
+    num_workers: int = 4,
+    val_ratio: float = 0.2,
+    seed: int = 42,
+    transform: Optional[T.Compose] = None,
+    mask_transform: Optional[T.Compose] = None,
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    Create train/val DataLoaders from the training split.
+    """
+    full_ds = PH2Dataset(
+        root=root,
+        target="lesion",  # 'lesion' | 'roi' | 'both'
+        image_tfms=transform,  # or None to use defaults
+        mask_tfms=mask_transform,  # or None to use defaults
+        size=None,  # if you rely entirely on the custom transforms above
+        roi_preference="R1",  # or "largest"
+        return_paths=False
+    )
 
+    # Split reproducibly
+    n_total = len(full_ds)
+    n_val = int(round(n_total * val_ratio))
+    n_train = n_total - n_val
+    gen = torch.Generator().manual_seed(seed)
+    train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=gen)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+    return train_loader, val_loader
 # ---------- Example usage ----------
 
 if __name__ == "__main__":
-    root = r"C:\Users\lucas\PycharmProjects\02516_Assignment_03\data\PH2_Dataset_images"  # <- change to your path
+    data_root = r"C:\Users\lucas\PycharmProjects\02516_Assignment_03\data\PH2_Dataset_images"  # <- change to your path
 
     # Optional: add augmentations on top of the defaults
     image_tfms = T.Compose([
@@ -185,25 +230,23 @@ if __name__ == "__main__":
         T.PILToTensor()
     ])
 
-    ds = PH2Dataset(
-        root=root,
-        target="lesion",           # 'lesion' | 'roi' | 'both'
-        image_tfms=image_tfms,   # or None to use defaults
-        mask_tfms=mask_tfms,     # or None to use defaults
-        size=None,               # if you rely entirely on the custom transforms above
-        roi_preference="R1",     # or "largest"
-        return_paths=False
+    train_loader, val_loader = build_dataloaders(
+        data_root,
+        batch_size=4,
+        num_workers=2,
+        val_ratio=0.2,
+        transform=image_tfms,
+        mask_transform=mask_tfms,
     )
 
-    loader = DataLoader(ds, batch_size=4, shuffle=True, num_workers=0, pin_memory=False)
-
     # Iterate
-    for images, masks in loader:
+    for images, masks in train_loader:
         # images:  [B, 3, H, W]
         # masks:   dict with keys 'lesion' and 'roi', each [B, 1, H, W] (since target='both')
         # ... your training step ...
         print(images.shape, masks.shape) # torch.Size([1, 3, 384, 384]) torch.Size([1, 1, 384, 384]) torch.Size([1, 1, 384, 384])
         print(images.dtype, masks.dtype)
+
         # Take the first item in the batch
         img = images[0]  # [3, H, W]
         lesion = masks[0, 0]  # [H, W]
@@ -224,6 +267,4 @@ if __name__ == "__main__":
 
         plt.tight_layout()
         plt.show()
-        break
-
         break

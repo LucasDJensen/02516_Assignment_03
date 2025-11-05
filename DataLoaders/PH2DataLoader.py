@@ -3,6 +3,10 @@ from glob import glob
 from typing import Callable, Dict, List, Literal, Optional, Tuple
 
 import torch
+<<<<<<< HEAD
+=======
+from torch.utils.data import Dataset, DataLoader, random_split
+>>>>>>> d783e496fba88c51c8bf0ba0a618ab82d061c67f
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, random_split
 import torchvision.transforms as T
@@ -32,15 +36,16 @@ class PH2Dataset(Dataset):
         return_paths: if True, adds a 'paths' entry mirroring the meta dictionary.
                       Samples always follow {"image": tensor, "mask": tensor, "meta": dict}.
     """
+
     def __init__(
-        self,
-        root: str,
-        target: Literal["lesion", "roi", "both"] = "lesion",
-        image_tfms: Optional[Callable] = None,
-        mask_tfms: Optional[Callable] = None,
-        size: Optional[Tuple[int, int]] = (256, 256),
-        roi_preference: Literal["R1", "largest"] = "R1",
-        return_paths: bool = False,
+            self,
+            root: str,
+            target: Literal["lesion", "roi", "both"] = "lesion",
+            image_tfms: Optional[Callable] = None,
+            mask_tfms: Optional[Callable] = None,
+            size: Optional[Tuple[int, int]] = (256, 256),
+            roi_preference: Literal["R1", "largest"] = "R1",
+            return_paths: bool = False,
     ) -> None:
         super().__init__()
         self.root = root
@@ -122,6 +127,7 @@ class PH2Dataset(Dataset):
             img = img.convert("RGB")
         return img
 
+<<<<<<< HEAD
     @staticmethod
     def _mask_to_binary(mask_img: Image.Image) -> torch.Tensor:
         """
@@ -133,24 +139,27 @@ class PH2Dataset(Dataset):
         tensor = T.functional.pil_to_tensor(mask_img)  # uint8, 1xHxW
         return (tensor > 0).float()
 
+=======
+>>>>>>> d783e496fba88c51c8bf0ba0a618ab82d061c67f
     def __getitem__(self, idx: int):
         item = self.items[idx]
         img = self._img_to_rgb(item["image"])
         img = self.image_tfms(img)  # float [0..1], 3xHxW
 
-        # Prepare masks
-        lesion_t, roi_t = None, None
+        m = Image.open(item["lesion"]).convert("L")
+        m = self.mask_tfms(m)  # uint8, 1xHxW
+        lesion_t = (m > 0).float()  # binary mask {0,1}
 
-        if self.target in ("lesion", "both") and item["lesion"] is not None:
-            m = Image.open(item["lesion"]).convert("L")
-            m = self.mask_tfms(m)  # uint8, 1xHxW
-            lesion_t = (m > 0).float()  # binary mask {0,1}
+        return {
+            "image": img,
+            "mask": lesion_t,
+            "id": item["case"],
+            "image_path": item["image"],
+            "mask_path": item["lesion"],
+        }
 
-        if self.target in ("roi", "both") and item["roi"] is not None:
-            m = Image.open(item["roi"]).convert("L")
-            m = self.mask_tfms(m)
-            roi_t = (m > 0).float()
 
+<<<<<<< HEAD
         if self.target == "lesion":
             if lesion_t is None:
                 raise FileNotFoundError(f"No lesion mask found for case {item['case']}")
@@ -176,6 +185,54 @@ class PH2Dataset(Dataset):
         if self.return_paths:
             sample["paths"] = meta
         return sample
+=======
+def build_dataloaders(
+        root: str,  # path to the DRIVE root (folder that contains "training")
+        batch_size: int = 4,
+        num_workers: int = 4,
+        val_ratio: float = 0.2,
+        seed: int = 42,
+        transform: Optional[T.Compose] = None,
+        mask_transform: Optional[T.Compose] = None,
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    Create train/val DataLoaders from the training split.
+    """
+    full_ds = PH2Dataset(
+        root=root,
+        target="lesion",  # 'lesion' | 'roi' | 'both'
+        image_tfms=transform,  # or None to use defaults
+        mask_tfms=mask_transform,  # or None to use defaults
+        size=None,  # if you rely entirely on the custom transforms above
+        roi_preference="R1",  # or "largest"
+        return_paths=False
+    )
+
+    # Split reproducibly
+    n_total = len(full_ds)
+    n_val = int(round(n_total * val_ratio))
+    n_train = n_total - n_val
+    gen = torch.Generator().manual_seed(seed)
+    train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=gen)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+    return train_loader, val_loader
+>>>>>>> d783e496fba88c51c8bf0ba0a618ab82d061c67f
 
 
 def create_ph2_dataloaders(
@@ -191,12 +248,18 @@ def create_ph2_dataloaders(
     """
     Convenience helper that instantiates PH2Dataset and returns train/val loaders.
 
+<<<<<<< HEAD
     Parameters mirror PH2Dataset, with additional DataLoader hyperparameters.
     """
+=======
+if __name__ == "__main__":
+    data_root = r"C:\Users\lucas\PycharmProjects\02516_Assignment_03\data\PH2_Dataset_images"  # <- change to your path
+>>>>>>> d783e496fba88c51c8bf0ba0a618ab82d061c67f
 
     dataset_kwargs.setdefault("target", "lesion")
     dataset = PH2Dataset(root=root, **dataset_kwargs)
 
+<<<<<<< HEAD
     if not 0.0 <= val_split < 1.0:
         raise ValueError("val_split must be in [0, 1).")
     if not 0.0 <= test_split < 1.0:
@@ -247,9 +310,19 @@ def create_ph2_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=False,
+=======
+    train_loader, val_loader = build_dataloaders(
+        data_root,
+        batch_size=4,
+        num_workers=2,
+        val_ratio=0.2,
+        transform=image_tfms,
+        mask_transform=mask_tfms,
+>>>>>>> d783e496fba88c51c8bf0ba0a618ab82d061c67f
     )
     loaders: Dict[str, DataLoader] = {"train": train_loader}
 
+<<<<<<< HEAD
     if val_dataset is not None:
         loaders["val"] = DataLoader(
             val_dataset,
@@ -274,3 +347,26 @@ def create_ph2_dataloaders(
 
 
 __all__ = ["PH2Dataset", "create_ph2_dataloaders"]
+=======
+    # Iterate
+    for batch in train_loader:
+        images = batch["image"]  # [B,3,H,W]
+        masks = batch["mask"]  # [B,1,H,W]
+        ids = batch["id"]
+        print(images.shape, masks.shape, ids)
+        # plot images
+        plt.figure(figsize=(10, 5))
+        for i in range(4):
+            plt.subplot(2, 4, i + 1)
+            plt.imshow(images[i].permute(1, 2, 0))
+            plt.title(f"Image {ids[i]}")
+            plt.axis('off')
+            plt.subplot(2, 4, i + 5)
+            plt.imshow(masks[i, 0], cmap='gray')
+            plt.title(f"Mask {ids[i]}")
+            plt.axis('off')
+
+        plt.tight_layout()
+        plt.show()
+        break
+>>>>>>> d783e496fba88c51c8bf0ba0a618ab82d061c67f

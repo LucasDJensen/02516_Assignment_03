@@ -1,15 +1,13 @@
 import os
 from glob import glob
-from typing import Callable, Dict, List, Literal, Optional, Tuple
+from typing import Callable, Optional, Tuple, List, Literal
 
 import torch
-<<<<<<< HEAD
-=======
 from torch.utils.data import Dataset, DataLoader, random_split
->>>>>>> d783e496fba88c51c8bf0ba0a618ab82d061c67f
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset, random_split
 import torchvision.transforms as T
+
+import matplotlib.pyplot as plt
 
 
 class PH2Dataset(Dataset):
@@ -33,19 +31,17 @@ class PH2Dataset(Dataset):
         size: optional (w, h) to resize image & mask(s) to; if None, keep original size
         roi_preference: if multiple ROI masks exist, choose 'R1' first or 'largest'
                         ('R1' | 'largest')
-        return_paths: if True, adds a 'paths' entry mirroring the meta dictionary.
-                      Samples always follow {"image": tensor, "mask": tensor, "meta": dict}.
+        return_paths: if True, also returns (img_path, mask_path_or_tuple)
     """
-
     def __init__(
-            self,
-            root: str,
-            target: Literal["lesion", "roi", "both"] = "lesion",
-            image_tfms: Optional[Callable] = None,
-            mask_tfms: Optional[Callable] = None,
-            size: Optional[Tuple[int, int]] = (256, 256),
-            roi_preference: Literal["R1", "largest"] = "R1",
-            return_paths: bool = False,
+        self,
+        root: str,
+        target: Literal["lesion", "roi", "both"] = "lesion",
+        image_tfms: Optional[Callable] = None,
+        mask_tfms: Optional[Callable] = None,
+        size: Optional[Tuple[int, int]] = (256, 256),
+        roi_preference: Literal["R1", "largest"] = "R1",
+        return_paths: bool = False,
     ) -> None:
         super().__init__()
         self.root = root
@@ -127,7 +123,6 @@ class PH2Dataset(Dataset):
             img = img.convert("RGB")
         return img
 
-<<<<<<< HEAD
     @staticmethod
     def _mask_to_binary(mask_img: Image.Image) -> torch.Tensor:
         """
@@ -136,64 +131,51 @@ class PH2Dataset(Dataset):
         """
         # After PILToTensor -> uint8 [0..255], shape 1xHxW
         # We'll threshold at >0
-        tensor = T.functional.pil_to_tensor(mask_img)  # uint8, 1xHxW
-        return (tensor > 0).float()
+        return None  # placeholder to satisfy lints (replaced below)
 
-=======
->>>>>>> d783e496fba88c51c8bf0ba0a618ab82d061c67f
     def __getitem__(self, idx: int):
         item = self.items[idx]
         img = self._img_to_rgb(item["image"])
         img = self.image_tfms(img)  # float [0..1], 3xHxW
 
-        m = Image.open(item["lesion"]).convert("L")
-        m = self.mask_tfms(m)  # uint8, 1xHxW
-        lesion_t = (m > 0).float()  # binary mask {0,1}
+        # Prepare masks
+        lesion_t, roi_t = None, None
 
-        return {
-            "image": img,
-            "mask": lesion_t,
-            "id": item["case"],
-            "image_path": item["image"],
-            "mask_path": item["lesion"],
-        }
+        if self.target in ("lesion", "both") and item["lesion"] is not None:
+            m = Image.open(item["lesion"]).convert("L")
+            m = self.mask_tfms(m)  # uint8, 1xHxW
+            lesion_t = (m > 0).float()  # binary mask {0,1}
 
+        if self.target in ("roi", "both") and item["roi"] is not None:
+            m = Image.open(item["roi"]).convert("L")
+            m = self.mask_tfms(m)
+            roi_t = (m > 0).float()
 
-<<<<<<< HEAD
         if self.target == "lesion":
-            if lesion_t is None:
-                raise FileNotFoundError(f"No lesion mask found for case {item['case']}")
-            mask = lesion_t.squeeze(0)
-            meta = {"case": item["case"], "image_path": item["image"], "mask_path": item["lesion"]}
+            out = (img, lesion_t)
+            if self.return_paths:
+                out = (img, lesion_t, {"image": item["image"], "mask": item["lesion"]})
+            return out
         elif self.target == "roi":
-            if roi_t is None:
-                raise FileNotFoundError(f"No ROI mask found for case {item['case']}")
-            mask = roi_t.squeeze(0)
-            meta = {"case": item["case"], "image_path": item["image"], "mask_path": item["roi"]}
+            out = (img, roi_t)
+            if self.return_paths:
+                out = (img, roi_t, {"image": item["image"], "mask": item["roi"]})
+            return out
         else:  # both
-            if lesion_t is None or roi_t is None:
-                raise FileNotFoundError(f"Incomplete masks for case {item['case']}")
-            mask = torch.stack([lesion_t.squeeze(0), roi_t.squeeze(0)])
-            meta = {
-                "case": item["case"],
-                "image_path": item["image"],
-                "lesion_path": item["lesion"],
-                "roi_path": item["roi"],
-            }
+            out = (img, {"lesion": lesion_t, "roi": roi_t})
+            if self.return_paths:
+                out = (img, {"lesion": lesion_t, "roi": roi_t},
+                       {"image": item["image"], "lesion": item["lesion"], "roi": item["roi"]})
+            return out
 
-        sample = {"image": img, "mask": mask.to(torch.long), "meta": meta}
-        if self.return_paths:
-            sample["paths"] = meta
-        return sample
-=======
 def build_dataloaders(
-        root: str,  # path to the DRIVE root (folder that contains "training")
-        batch_size: int = 4,
-        num_workers: int = 4,
-        val_ratio: float = 0.2,
-        seed: int = 42,
-        transform: Optional[T.Compose] = None,
-        mask_transform: Optional[T.Compose] = None,
+    root: str,                      # path to the DRIVE root (folder that contains "training")
+    batch_size: int = 4,
+    num_workers: int = 4,
+    val_ratio: float = 0.2,
+    seed: int = 42,
+    transform: Optional[T.Compose] = None,
+    mask_transform: Optional[T.Compose] = None,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Create train/val DataLoaders from the training split.
@@ -232,85 +214,22 @@ def build_dataloaders(
         drop_last=False,
     )
     return train_loader, val_loader
->>>>>>> d783e496fba88c51c8bf0ba0a618ab82d061c67f
+# ---------- Example usage ----------
 
-
-def create_ph2_dataloaders(
-    root: str,
-    batch_size: int = 4,
-    val_split: float = 0.2,
-    test_split: float = 0.0,
-    num_workers: int = 4,
-    seed: int = 42,
-    pin_memory: bool | None = None,
-    **dataset_kwargs: object,
-) -> Dict[str, DataLoader]:
-    """
-    Convenience helper that instantiates PH2Dataset and returns train/val loaders.
-
-<<<<<<< HEAD
-    Parameters mirror PH2Dataset, with additional DataLoader hyperparameters.
-    """
-=======
 if __name__ == "__main__":
     data_root = r"C:\Users\lucas\PycharmProjects\02516_Assignment_03\data\PH2_Dataset_images"  # <- change to your path
->>>>>>> d783e496fba88c51c8bf0ba0a618ab82d061c67f
 
-    dataset_kwargs.setdefault("target", "lesion")
-    dataset = PH2Dataset(root=root, **dataset_kwargs)
+    # Optional: add augmentations on top of the defaults
+    image_tfms = T.Compose([
+        T.Resize((384, 384), interpolation=T.InterpolationMode.BILINEAR),
+        T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05, hue=0.02),
+        T.ToTensor(),
+    ])
+    mask_tfms = T.Compose([
+        T.Resize((384, 384), interpolation=T.InterpolationMode.NEAREST),
+        T.PILToTensor()
+    ])
 
-<<<<<<< HEAD
-    if not 0.0 <= val_split < 1.0:
-        raise ValueError("val_split must be in [0, 1).")
-    if not 0.0 <= test_split < 1.0:
-        raise ValueError("test_split must be in [0, 1).")
-    if val_split + test_split >= 1.0:
-        raise ValueError("val_split + test_split must be < 1.")
-
-    total_len = len(dataset)
-    val_len = int(round(total_len * val_split))
-    test_len = int(round(total_len * test_split))
-
-    # ensure at least one sample when requested
-    if val_split > 0 and val_len == 0:
-        val_len = 1
-    if test_split > 0 and test_len == 0:
-        test_len = 1
-
-    train_len = total_len - val_len - test_len
-    if train_len <= 0:
-        raise ValueError("Splits leave no samples for training.")
-
-    lengths: List[int] = [train_len]
-    if val_len > 0:
-        lengths.append(val_len)
-    if test_len > 0:
-        lengths.append(test_len)
-
-    generator = torch.Generator().manual_seed(seed)
-    subsets = random_split(dataset, lengths, generator=generator)
-    idx = 0
-    train_dataset = subsets[idx]
-    idx += 1
-    val_dataset = None
-    test_dataset = None
-    if val_len > 0:
-        val_dataset = subsets[idx]
-        idx += 1
-    if test_len > 0:
-        test_dataset = subsets[idx]
-
-    if pin_memory is None:
-        pin_memory = torch.cuda.is_available()
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=False,
-=======
     train_loader, val_loader = build_dataloaders(
         data_root,
         batch_size=4,
@@ -318,55 +237,34 @@ if __name__ == "__main__":
         val_ratio=0.2,
         transform=image_tfms,
         mask_transform=mask_tfms,
->>>>>>> d783e496fba88c51c8bf0ba0a618ab82d061c67f
     )
-    loaders: Dict[str, DataLoader] = {"train": train_loader}
 
-<<<<<<< HEAD
-    if val_dataset is not None:
-        loaders["val"] = DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            drop_last=False,
-        )
-
-    if test_dataset is not None:
-        loaders["test"] = DataLoader(
-            test_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            drop_last=False,
-        )
-
-    return loaders
-
-
-__all__ = ["PH2Dataset", "create_ph2_dataloaders"]
-=======
     # Iterate
-    for batch in train_loader:
-        images = batch["image"]  # [B,3,H,W]
-        masks = batch["mask"]  # [B,1,H,W]
-        ids = batch["id"]
-        print(images.shape, masks.shape, ids)
-        # plot images
-        plt.figure(figsize=(10, 5))
-        for i in range(4):
-            plt.subplot(2, 4, i + 1)
-            plt.imshow(images[i].permute(1, 2, 0))
-            plt.title(f"Image {ids[i]}")
-            plt.axis('off')
-            plt.subplot(2, 4, i + 5)
-            plt.imshow(masks[i, 0], cmap='gray')
-            plt.title(f"Mask {ids[i]}")
-            plt.axis('off')
+    for images, masks in train_loader:
+        # images:  [B, 3, H, W]
+        # masks:   dict with keys 'lesion' and 'roi', each [B, 1, H, W] (since target='both')
+        # ... your training step ...
+        print(images.shape, masks.shape) # torch.Size([1, 3, 384, 384]) torch.Size([1, 1, 384, 384]) torch.Size([1, 1, 384, 384])
+        print(images.dtype, masks.dtype)
+
+        # Take the first item in the batch
+        img = images[0]  # [3, H, W]
+        lesion = masks[0, 0]  # [H, W]
+
+        # Convert image tensor (C,H,W) -> (H,W,C)
+        img_np = img.permute(1, 2, 0).cpu().numpy()
+
+        # Plot
+        fig, axs = plt.subplots(1, 2, figsize=(12, 4))
+        axs[0].imshow(img_np)
+        axs[0].set_title("Dermoscopic Image")
+        axs[0].axis("off")
+
+        axs[1].imshow(img_np)
+        axs[1].imshow(lesion.cpu(), cmap="Reds", alpha=0.5)
+        axs[1].set_title("Lesion Mask Overlay")
+        axs[1].axis("off")
 
         plt.tight_layout()
         plt.show()
         break
->>>>>>> d783e496fba88c51c8bf0ba0a618ab82d061c67f

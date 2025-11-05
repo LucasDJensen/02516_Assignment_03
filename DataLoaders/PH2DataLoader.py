@@ -33,15 +33,16 @@ class PH2Dataset(Dataset):
                         ('R1' | 'largest')
         return_paths: if True, also returns (img_path, mask_path_or_tuple)
     """
+
     def __init__(
-        self,
-        root: str,
-        target: Literal["lesion", "roi", "both"] = "lesion",
-        image_tfms: Optional[Callable] = None,
-        mask_tfms: Optional[Callable] = None,
-        size: Optional[Tuple[int, int]] = (256, 256),
-        roi_preference: Literal["R1", "largest"] = "R1",
-        return_paths: bool = False,
+            self,
+            root: str,
+            target: Literal["lesion", "roi", "both"] = "lesion",
+            image_tfms: Optional[Callable] = None,
+            mask_tfms: Optional[Callable] = None,
+            size: Optional[Tuple[int, int]] = (256, 256),
+            roi_preference: Literal["R1", "largest"] = "R1",
+            return_paths: bool = False,
     ) -> None:
         super().__init__()
         self.root = root
@@ -123,59 +124,32 @@ class PH2Dataset(Dataset):
             img = img.convert("RGB")
         return img
 
-    @staticmethod
-    def _mask_to_binary(mask_img: Image.Image) -> torch.Tensor:
-        """
-        Converts a grayscale mask PIL image to float tensor in {0,1}, shape 1xHxW.
-        Assumes lesion/roi masks are white foreground on black background.
-        """
-        # After PILToTensor -> uint8 [0..255], shape 1xHxW
-        # We'll threshold at >0
-        return None  # placeholder to satisfy lints (replaced below)
-
     def __getitem__(self, idx: int):
         item = self.items[idx]
         img = self._img_to_rgb(item["image"])
         img = self.image_tfms(img)  # float [0..1], 3xHxW
 
-        # Prepare masks
-        lesion_t, roi_t = None, None
+        m = Image.open(item["lesion"]).convert("L")
+        m = self.mask_tfms(m)  # uint8, 1xHxW
+        lesion_t = (m > 0).float()  # binary mask {0,1}
 
-        if self.target in ("lesion", "both") and item["lesion"] is not None:
-            m = Image.open(item["lesion"]).convert("L")
-            m = self.mask_tfms(m)  # uint8, 1xHxW
-            lesion_t = (m > 0).float()  # binary mask {0,1}
+        return {
+            "image": img,
+            "mask": lesion_t,
+            "id": item["case"],
+            "image_path": item["image"],
+            "mask_path": item["lesion"],
+        }
 
-        if self.target in ("roi", "both") and item["roi"] is not None:
-            m = Image.open(item["roi"]).convert("L")
-            m = self.mask_tfms(m)
-            roi_t = (m > 0).float()
-
-        if self.target == "lesion":
-            out = (img, lesion_t)
-            if self.return_paths:
-                out = (img, lesion_t, {"image": item["image"], "mask": item["lesion"]})
-            return out
-        elif self.target == "roi":
-            out = (img, roi_t)
-            if self.return_paths:
-                out = (img, roi_t, {"image": item["image"], "mask": item["roi"]})
-            return out
-        else:  # both
-            out = (img, {"lesion": lesion_t, "roi": roi_t})
-            if self.return_paths:
-                out = (img, {"lesion": lesion_t, "roi": roi_t},
-                       {"image": item["image"], "lesion": item["lesion"], "roi": item["roi"]})
-            return out
 
 def build_dataloaders(
-    root: str,                      # path to the DRIVE root (folder that contains "training")
-    batch_size: int = 4,
-    num_workers: int = 4,
-    val_ratio: float = 0.2,
-    seed: int = 42,
-    transform: Optional[T.Compose] = None,
-    mask_transform: Optional[T.Compose] = None,
+        root: str,  # path to the DRIVE root (folder that contains "training")
+        batch_size: int = 4,
+        num_workers: int = 4,
+        val_ratio: float = 0.2,
+        seed: int = 42,
+        transform: Optional[T.Compose] = None,
+        mask_transform: Optional[T.Compose] = None,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Create train/val DataLoaders from the training split.
@@ -214,6 +188,8 @@ def build_dataloaders(
         drop_last=False,
     )
     return train_loader, val_loader
+
+
 # ---------- Example usage ----------
 
 if __name__ == "__main__":
@@ -240,30 +216,22 @@ if __name__ == "__main__":
     )
 
     # Iterate
-    for images, masks in train_loader:
-        # images:  [B, 3, H, W]
-        # masks:   dict with keys 'lesion' and 'roi', each [B, 1, H, W] (since target='both')
-        # ... your training step ...
-        print(images.shape, masks.shape) # torch.Size([1, 3, 384, 384]) torch.Size([1, 1, 384, 384]) torch.Size([1, 1, 384, 384])
-        print(images.dtype, masks.dtype)
-
-        # Take the first item in the batch
-        img = images[0]  # [3, H, W]
-        lesion = masks[0, 0]  # [H, W]
-
-        # Convert image tensor (C,H,W) -> (H,W,C)
-        img_np = img.permute(1, 2, 0).cpu().numpy()
-
-        # Plot
-        fig, axs = plt.subplots(1, 2, figsize=(12, 4))
-        axs[0].imshow(img_np)
-        axs[0].set_title("Dermoscopic Image")
-        axs[0].axis("off")
-
-        axs[1].imshow(img_np)
-        axs[1].imshow(lesion.cpu(), cmap="Reds", alpha=0.5)
-        axs[1].set_title("Lesion Mask Overlay")
-        axs[1].axis("off")
+    for batch in train_loader:
+        images = batch["image"]  # [B,3,H,W]
+        masks = batch["mask"]  # [B,1,H,W]
+        ids = batch["id"]
+        print(images.shape, masks.shape, ids)
+        # plot images
+        plt.figure(figsize=(10, 5))
+        for i in range(4):
+            plt.subplot(2, 4, i + 1)
+            plt.imshow(images[i].permute(1, 2, 0))
+            plt.title(f"Image {ids[i]}")
+            plt.axis('off')
+            plt.subplot(2, 4, i + 5)
+            plt.imshow(masks[i, 0], cmap='gray')
+            plt.title(f"Mask {ids[i]}")
+            plt.axis('off')
 
         plt.tight_layout()
         plt.show()

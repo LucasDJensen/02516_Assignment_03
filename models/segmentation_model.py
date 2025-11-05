@@ -20,7 +20,7 @@ structure makes it easy to extend the loader later with auxiliary inputs.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -38,7 +38,7 @@ class SegmentationModelConfig:
     in_channels: int = 3  # RGB input image
     num_classes: int = 2  # Foreground / background by default
     encoder_channels: Tuple[int, ...] = (64, 128, 256, 512)
-    decoder_channels: Tuple[int, ...] = (512, 256, 128, 64)
+    decoder_channels: Optional[Tuple[int, ...]] = None  # auto-derived from encoder_channels by default
     kernel_size: int = 3
     padding: int = 1
     dropout_p: float = 0.1  # Set to 0 to disable dropout
@@ -79,6 +79,19 @@ class SegmentationModel(nn.Module):
         super().__init__()
         self.config = config or SegmentationModelConfig()
 
+        expected_decoder_channels = self._compute_default_decoder_channels(self.config.encoder_channels)
+        if self.config.decoder_channels is None:
+            decoder_channels = expected_decoder_channels
+        else:
+            decoder_channels = self.config.decoder_channels
+            if len(decoder_channels) != len(expected_decoder_channels):
+                raise ValueError(
+                    "decoder_channels length must match encoder depth to align pooling/unpooling operations. "
+                    f"Expected {len(expected_decoder_channels)} channels, got {len(decoder_channels)}."
+                )
+        self._decoder_channels = decoder_channels
+        self.config.decoder_channels = decoder_channels
+
         self.encoder_blocks = self._build_blocks(
             self.config.in_channels,
             self.config.encoder_channels,
@@ -86,7 +99,7 @@ class SegmentationModel(nn.Module):
         )
         self.decoder_blocks = self._build_blocks(
             self.config.encoder_channels[-1],
-            self.config.decoder_channels,
+            self._decoder_channels,
             block_type="decoder",
         )
 
@@ -101,7 +114,14 @@ class SegmentationModel(nn.Module):
                 f"Got {len(self.encoder_blocks)} encoder blocks and {len(self.decoder_blocks)} decoder blocks."
             )
 
-        self.classifier = nn.Conv2d(self.config.decoder_channels[-1], self.config.num_classes, kernel_size=1)
+        if tuple(self._decoder_channels) != tuple(expected_decoder_channels):
+            raise ValueError(
+                "decoder_channels must mirror encoder_channels (excluding the deepest level) followed by the "
+                "first encoder channel when using MaxUnpool indices. "
+                f"Expected {expected_decoder_channels}, got {self._decoder_channels}."
+            )
+
+        self.classifier = nn.Conv2d(self._decoder_channels[-1], self.config.num_classes, kernel_size=1)
 
     def _build_blocks(self, in_channels: int, channel_sequence: Iterable[int], block_type: str) -> nn.ModuleList:
         blocks: List[nn.Module] = []
@@ -118,6 +138,15 @@ class SegmentationModel(nn.Module):
             )
             current_in = out_ch
         return nn.ModuleList(blocks)
+
+    @staticmethod
+    def _compute_default_decoder_channels(encoder_channels: Tuple[int, ...]) -> Tuple[int, ...]:
+        if len(encoder_channels) == 0:
+            raise ValueError("encoder_channels must contain at least one element.")
+        mirrored = list(encoder_channels[:-1])
+        mirrored.reverse()
+        mirrored.append(encoder_channels[0])
+        return tuple(mirrored)
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """

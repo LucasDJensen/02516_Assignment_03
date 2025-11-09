@@ -22,6 +22,7 @@ import matplotlib
 matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 
+import numpy as np
 import torch
 from packaging import version
 from torch import nn
@@ -194,6 +195,115 @@ def _save_history(history: list[Dict[str, object]], artifact_dir: str) -> str:
     return history_path
 
 
+def _save_checkpoint(model: nn.Module, artifact_dir: str, filename: str) -> str:
+    os.makedirs(artifact_dir, exist_ok=True)
+    path = os.path.join(artifact_dir, filename)
+    torch.save({"state_dict": model.state_dict()}, path)
+    return path
+
+
+def _tensor_to_display(tensor: torch.Tensor) -> np.ndarray:
+    tensor = tensor.detach().cpu().float()
+    if tensor.ndim == 3:
+        if tensor.shape[0] == 1:
+            array = tensor.squeeze(0)
+        else:
+            array = tensor.permute(1, 2, 0)
+    elif tensor.ndim == 2:
+        array = tensor
+    else:
+        array = tensor
+    array = array.numpy()
+    min_val = np.min(array)
+    max_val = np.max(array)
+    # Avoid division by zero for constant images.
+    if max_val - min_val > 1e-8:
+        array = (array - min_val) / (max_val - min_val)
+    else:
+        array = np.zeros_like(array)
+    return array
+
+
+def _extract_sample_id(meta_entry) -> str | None:
+    if meta_entry is None:
+        return None
+    if isinstance(meta_entry, dict):
+        for key in ("id", "name", "filename", "file"):
+            if key in meta_entry and meta_entry[key]:
+                return str(meta_entry[key])
+    else:
+        return os.path.basename(str(meta_entry))
+    return None
+
+
+def _save_prediction_samples(
+    model: nn.Module,
+    loader: Iterable[Dict[str, object]],
+    device: torch.device,
+    artifact_dir: str | None,
+    split_name: str,
+    max_images: int = 4,
+) -> list[str]:
+    if artifact_dir is None or loader is None or max_images <= 0:
+        return []
+
+    samples_dir = os.path.join(artifact_dir, "samples", split_name)
+    os.makedirs(samples_dir, exist_ok=True)
+
+    model_was_training = model.training
+    model.eval()
+    saved_paths: list[str] = []
+    images_saved = 0
+
+    with torch.no_grad():
+        for raw_batch in loader:
+            batch = _prepare_batch(raw_batch, device)
+            images, masks = batch["image"], batch["mask"]
+            logits = model({"image": images})
+            preds = logits.argmax(dim=1)
+            meta = batch.get("meta")
+
+            for idx in range(images.size(0)):
+                if images_saved >= max_images:
+                    break
+
+                input_img = _tensor_to_display(images[idx])
+                target_mask = _tensor_to_display(masks[idx])
+                pred_mask = _tensor_to_display(preds[idx])
+
+                fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+                axes[0].imshow(input_img, cmap="gray" if input_img.ndim == 2 else None)
+                axes[0].set_title("Input")
+                axes[1].imshow(target_mask, cmap="gray")
+                axes[1].set_title("Target")
+                axes[2].imshow(pred_mask, cmap="gray")
+                axes[2].set_title("Prediction")
+                for ax in axes:
+                    ax.axis("off")
+
+                sample_id = None
+                if isinstance(meta, (list, tuple)) and idx < len(meta):
+                    sample_id = _extract_sample_id(meta[idx])
+                if sample_id:
+                    fig.suptitle(f"{split_name.capitalize()} sample: {sample_id}", fontsize=10)
+
+                filename = f"{split_name}_sample_{images_saved + 1}.png"
+                save_path = os.path.join(samples_dir, filename)
+                fig.tight_layout()
+                fig.savefig(save_path, dpi=200)
+                plt.close(fig)
+
+                saved_paths.append(save_path)
+                images_saved += 1
+
+            if images_saved >= max_images:
+                break
+
+    if model_was_training:
+        model.train()
+    return saved_paths
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: Iterable[Dict[str, object]],
@@ -354,6 +464,8 @@ def main(argv: list[str] | None = None) -> int:
     optimizer = Adam(model.parameters(), lr=args.learning_rate)
     criterion = nn.CrossEntropyLoss()
     history: list[Dict[str, object]] = []
+    best_val_metric = -float("inf")
+    best_checkpoint_path: str | None = None
 
     for epoch in range(1, args.epochs + 1):
         train_stats = train_one_epoch(
@@ -393,11 +505,25 @@ def main(argv: list[str] | None = None) -> int:
             )
         print(" ".join(log_parts))
         history.append({"epoch": epoch, "train": _sanitize_stats(train_stats), "val": _sanitize_stats(val_stats)})
+        if artifact_dir and val_stats is not None:
+            candidate_metric = val_stats.get("dice")
+            if isinstance(candidate_metric, float) and math.isfinite(candidate_metric) and candidate_metric > best_val_metric:
+                best_val_metric = candidate_metric
+                best_checkpoint_path = _save_checkpoint(model, artifact_dir, "best_model.pt")
+                print(
+                    f"[Checkpoint] Saved new best model to {best_checkpoint_path} "
+                    f"(val_dice={candidate_metric:.3f})"
+                )
 
     if artifact_dir and history:
         history_path = _save_history(history, artifact_dir)
         curves_path = _plot_training_curves(history, artifact_dir)
         print(f"[Artifacts] metrics={history_path} curves={curves_path}")
+        last_checkpoint_path = _save_checkpoint(model, artifact_dir, "last_model.pt")
+        info = f"[Checkpoint] last={last_checkpoint_path}"
+        if best_checkpoint_path:
+            info += f" best={best_checkpoint_path}"
+        print(info)
 
     if "val" in loaders:
         final_val = evaluate(
@@ -412,6 +538,9 @@ def main(argv: list[str] | None = None) -> int:
             f"acc={final_val['pixel_acc']:.3f} dice={final_val['dice']:.3f} "
             f"batches={final_val['num_batches']}"
         )
+        val_sample_paths = _save_prediction_samples(model, loaders["val"], device, artifact_dir, "val")
+        if val_sample_paths:
+            print(f"[Samples:val] saved {len(val_sample_paths)} preview(s): {val_sample_paths[0]}")
 
     if "test" in loaders:
         final_test = evaluate(
@@ -426,6 +555,9 @@ def main(argv: list[str] | None = None) -> int:
             f"acc={final_test['pixel_acc']:.3f} dice={final_test['dice']:.3f} "
             f"batches={final_test['num_batches']}"
         )
+        test_sample_paths = _save_prediction_samples(model, loaders["test"], device, artifact_dir, "test")
+        if test_sample_paths:
+            print(f"[Samples:test] saved {len(test_sample_paths)} preview(s): {test_sample_paths[0]}")
 
     return 0
 

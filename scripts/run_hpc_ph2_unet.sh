@@ -36,6 +36,9 @@
 source ~/02516_venv/bin/activate
 module load cuda/12.8.1
 
+STAMP=$(date +"%H%M%S")
+ARTIFACT_DIR="artifacts/ph2_unet_${STAMP}"
+
 python train.py \
   --dataset ph2 \
   --model unet \
@@ -48,4 +51,4 @@ python train.py \
   --learning-rate 1e-4 \
   --num-workers 4 \
   --amp \
-  --artifact-dir artifacts/ph2_unet
+  --artifact-dir "$ARTIFACT_DIR"

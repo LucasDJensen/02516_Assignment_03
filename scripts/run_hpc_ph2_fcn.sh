@@ -36,9 +36,6 @@
 source ~/02516_venv/bin/activate
 module load cuda/12.8.1
 
-STAMP=$(date +"%H%M%S")
-ARTIFACT_DIR="artifacts/ph2_fcn_${STAMP}"
-
 python train.py \
   --dataset ph2 \
   --model fcn \
@@ -50,5 +47,4 @@ python train.py \
   --batch-size 8 \
   --learning-rate 1e-4 \
   --num-workers 4 \
-  --amp \
-  --artifact-dir "$ARTIFACT_DIR"
+  --amp

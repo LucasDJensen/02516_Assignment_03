@@ -13,6 +13,7 @@ import json
 import math
 import os
 import sys
+from datetime import datetime
 from typing import Dict, Iterable
 
 import contextlib
@@ -445,7 +446,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    artifact_dir = _prepare_artifact_dir(args.artifact_dir.strip() if args.artifact_dir else None)
+    artifact_base = args.artifact_dir.strip() if args.artifact_dir else None
+    artifact_path = None
+    if artifact_base:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        artifact_path = os.path.join(artifact_base, timestamp)
+    artifact_dir = _prepare_artifact_dir(artifact_path)
     device = select_device(args.device)
     print(f"Using device: {device}")
 

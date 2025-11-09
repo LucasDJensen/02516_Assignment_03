@@ -35,7 +35,6 @@
 # execute our command
 source ~/02516_venv/bin/activate
 module load cuda/12.8.1
-cd ~/02516_Assignment_03
 
 python train.py \
   --dataset drive \

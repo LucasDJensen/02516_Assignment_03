@@ -9,11 +9,18 @@ ready for GPU execution on the DTU HPC cluster (paths default to /dtu/datasets1/
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import sys
 from typing import Dict, Iterable
 
 import contextlib
+
+import matplotlib
+
+matplotlib.use("Agg")
+from matplotlib import pyplot as plt
 
 import torch
 from packaging import version
@@ -27,8 +34,8 @@ from models.unet import create_unet
 
 # -- Default dataset roots on the DTU HPC --
 _DEFAULT_DATA_ROOTS = {
-    "ph2": os.environ.get("PH2_ROOT", "C:/Users/owner/Documents/DTU/Semester_1/comp_vision/PH2_Dataset_images"),
-    "drive": os.environ.get("DRIVE_ROOT", "C:/Users/owner/Documents/DTU/Semester_1/comp_vision/DRIVE"),
+    "ph2": os.environ.get("PH2_ROOT", "dtu/datasets1/02516/PH2_Dataset_images"),
+    "drive": os.environ.get("DRIVE_ROOT", "dtu/datasets1/02516/DRIVE"),
 }
 
 
@@ -48,6 +55,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="'auto', 'cpu', 'cuda', or specific device string.")
     parser.add_argument("--max-train-steps", type=int, default=0, help="Limit training steps per epoch (0 = all).")
     parser.add_argument("--amp", action="store_true", help="Enable automatic mixed precision (AMP).")
+    parser.add_argument(
+        "--artifact-dir",
+        default="artifacts",
+        help="Directory for saving training curves/metrics (set empty string to disable).",
+    )
     return parser.parse_args(argv)
 
 
@@ -107,6 +119,79 @@ def _dice_score(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> 
     pred_sum = pred_fg.sum().item()
     target_sum = target_fg.sum().item()
     return (2 * intersection + eps) / (pred_sum + target_sum + eps)
+
+
+def _prepare_artifact_dir(path: str | None) -> str | None:
+    if not path:
+        return None
+    resolved = os.path.abspath(path)
+    os.makedirs(resolved, exist_ok=True)
+    return resolved
+
+
+def _sanitize_stats(stats: Dict[str, float | int] | None) -> Dict[str, float | int | None] | None:
+    if stats is None:
+        return None
+    cleaned: Dict[str, float | int | None] = {}
+    for key, value in stats.items():
+        if isinstance(value, float):
+            cleaned[key] = value if math.isfinite(value) else None
+        elif isinstance(value, int):
+            cleaned[key] = value
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
+def _extract_metric(history: list[Dict[str, object]], split: str, metric: str) -> list[float | None]:
+    values: list[float | None] = []
+    for entry in history:
+        split_stats = entry.get(split)
+        if isinstance(split_stats, dict):
+            values.append(split_stats.get(metric))
+        else:
+            values.append(None)
+    return values
+
+
+def _nanify(values: list[float | None]) -> list[float]:
+    return [v if v is not None else float("nan") for v in values]
+
+
+def _plot_metric(ax, epochs: list[int], train_vals: list[float | None], val_vals: list[float | None], ylabel: str, title: str) -> None:
+    ax.plot(epochs, _nanify(train_vals), label="Train", marker="o")
+    if any(v is not None for v in val_vals):
+        ax.plot(epochs, _nanify(val_vals), label="Validation", marker="o")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+    ax.legend()
+
+
+def _plot_training_curves(history: list[Dict[str, object]], artifact_dir: str) -> str:
+    epochs = [entry.get("epoch") for entry in history]
+    train_loss = _extract_metric(history, "train", "loss")
+    val_loss = _extract_metric(history, "val", "loss")
+    train_acc = _extract_metric(history, "train", "pixel_acc")
+    val_acc = _extract_metric(history, "val", "pixel_acc")
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    _plot_metric(axes[0], epochs, train_loss, val_loss, "Loss", "Cross-Entropy Loss")
+    _plot_metric(axes[1], epochs, train_acc, val_acc, "Pixel Accuracy", "Pixel Accuracy")
+    fig.tight_layout()
+
+    figure_path = os.path.join(artifact_dir, "training_curves.png")
+    fig.savefig(figure_path, dpi=200)
+    plt.close(fig)
+    return figure_path
+
+
+def _save_history(history: list[Dict[str, object]], artifact_dir: str) -> str:
+    history_path = os.path.join(artifact_dir, "training_history.json")
+    with open(history_path, "w", encoding="utf-8") as fp:
+        json.dump(history, fp, indent=2)
+    return history_path
 
 
 def train_one_epoch(
@@ -250,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    artifact_dir = _prepare_artifact_dir(args.artifact_dir.strip() if args.artifact_dir else None)
     device = select_device(args.device)
     print(f"Using device: {device}")
 
@@ -267,6 +353,7 @@ def main(argv: list[str] | None = None) -> int:
 
     optimizer = Adam(model.parameters(), lr=args.learning_rate)
     criterion = nn.CrossEntropyLoss()
+    history: list[Dict[str, object]] = []
 
     for epoch in range(1, args.epochs + 1):
         train_stats = train_one_epoch(
@@ -305,6 +392,12 @@ def main(argv: list[str] | None = None) -> int:
                 ]
             )
         print(" ".join(log_parts))
+        history.append({"epoch": epoch, "train": _sanitize_stats(train_stats), "val": _sanitize_stats(val_stats)})
+
+    if artifact_dir and history:
+        history_path = _save_history(history, artifact_dir)
+        curves_path = _plot_training_curves(history, artifact_dir)
+        print(f"[Artifacts] metrics={history_path} curves={curves_path}")
 
     if "val" in loaders:
         final_val = evaluate(

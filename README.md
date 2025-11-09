@@ -7,13 +7,15 @@
 - The upcoming data loader should feed batches shaped like `{"image": tensor, "mask": tensor}`; see the docstring and the inline marker inside `forward`.
 - Adjust `SegmentationModelConfig` to tune depth, channels, dropout, or the number of classes once dataset details arrive.
 - `DataLoaders/PH2DataLoader.py` provides a dataset class and helper to build train/val/test loaders for PH2 (defaults to lesion masks, resized to 256×256).
-- `train.py` now trains end-to-end on PH2 via the provided dataloader, runs on GPU (AMP optional), and is ready to plug in additional datasets like DRIVE.
+- `DataLoaders/DRIVEDataLoader.py` mirrors the interface for the DRIVE retinal vessel dataset (with optional resizing and the correct vessel masks).
+- `train.py` now supports both datasets and can switch between the FCN scaffold and the U-Net baseline while logging per-split metrics.
 
 ### Quick start (DTU HPC)
 
 ```bash
 python train.py \
-  --dataset ph2 \
+  --dataset ph2 \  # or drive
+  --model fcn \    # or unet
   --data-root /dtu/datasets1/02516/PH2_Dataset_images \
   --device cuda \
   --val-split 0.2 \

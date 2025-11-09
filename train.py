@@ -21,19 +21,21 @@ from torch import nn
 from torch.optim import Adam
 
 from DataLoaders.PH2DataLoader import create_ph2_dataloaders
+from DataLoaders.DRIVEDataLoader import create_drive_dataloaders
 from models.segmentation_model import create_model
+from models.unet import create_unet
 
 # -- Default dataset roots on the DTU HPC --
 _DEFAULT_DATA_ROOTS = {
-    "ph2": "C:/Users/owner/Documents/DTU/Semester_1/comp_vision/PH2_Dataset_images",
-    "drive": "/dtu/datasets1/02516/DRIVE",
+    "ph2": os.environ.get("PH2_ROOT", "C:/Users/owner/Documents/DTU/Semester_1/comp_vision/PH2_Dataset_images"),
+    "drive": os.environ.get("DRIVE_ROOT", "C:/Users/owner/Documents/DTU/Semester_1/comp_vision/DRIVE"),
 }
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a segmentation model.")
-    parser.add_argument("--dataset", choices=("ph2", "drive"), default="ph2", help="Which dataset to use.")
-    parser.add_argument("--model", choices=("fcn", "unet"), default="fcn", help="Model architecture.")
+    parser.add_argument("--dataset", choices=("ph2", "drive"), default="drive", help="Which dataset to use.")
+    parser.add_argument("--model", choices=("fcn", "unet"), default="unet", help="Model architecture.")
     parser.add_argument("--data-root", default=None, help="Root directory for the chosen dataset.")
     parser.add_argument("--batch-size", type=int, default=4, help="Mini-batch size.")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader worker threads.")
@@ -56,30 +58,35 @@ def select_device(device_arg: str) -> torch.device:
 
 
 def build_model(name: str, num_classes: int) -> nn.Module:
-    if name == "fcn":
-        return create_model({"num_classes": num_classes})
-    if name == "unet":
-        raise NotImplementedError("U-Net model not yet integrated. Implement models/unet.py and update train.py.")
-    raise ValueError(f"Unknown model: {name}")
+    factories = {
+        "fcn": lambda: create_model({"num_classes": num_classes}),
+        "unet": lambda: create_unet(num_classes=num_classes),
+    }
+    if name not in factories:
+        raise ValueError(f"Unknown model: {name}")
+    return factories[name]()
 
 
 def build_dataloaders(args: argparse.Namespace) -> Dict[str, Iterable[Dict[str, object]]]:
+    size = (args.image_size, args.image_size) if args.image_size > 0 else None
     if args.dataset == "ph2":
-        dataset_kwargs = {}
-        if args.image_size > 0:
-            dataset_kwargs["size"] = (args.image_size, args.image_size)
-        else:
-            dataset_kwargs["size"] = None
         return create_ph2_dataloaders(
             root=args.data_root,
             batch_size=args.batch_size,
             val_split=args.val_split,
             test_split=args.test_split,
             num_workers=args.num_workers,
-            **dataset_kwargs,
+            size=size,
         )
     if args.dataset == "drive":
-        raise NotImplementedError("DRIVE dataloader not yet available.")
+        return create_drive_dataloaders(
+            root=args.data_root,
+            batch_size=args.batch_size,
+            val_split=args.val_split,
+            test_split=args.test_split,
+            num_workers=args.num_workers,
+            size=size,
+        )
     raise ValueError(f"Unsupported dataset: {args.dataset}")
 
 
@@ -104,7 +111,7 @@ def _dice_score(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> 
 
 def train_one_epoch(
     model: nn.Module,
-    loader: Iterable[Dict[str, torch.Tensor]],
+    loader: Iterable[Dict[str, object]],
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
@@ -112,20 +119,20 @@ def train_one_epoch(
     use_amp: bool,
 ) -> Dict[str, float]:
     model.train()
-    amp_device_type = device.type
     use_new_amp = version.parse(torch.__version__) >= version.parse("2.1.0")
     if use_amp and device.type != "cuda":
         raise ValueError("AMP is only supported on CUDA devices in this training script.")
 
-    if use_new_amp:
-        scaler = torch.amp.GradScaler(enabled=use_amp)
-        autocast_ctx = torch.amp.autocast(device_type=amp_device_type, enabled=use_amp)
-    else:
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-        if use_amp:
-            autocast_ctx = torch.cuda.amp.autocast()
+    if use_amp:
+        if use_new_amp:
+            scaler = torch.amp.GradScaler(enabled=True)
+            autocast_factory = lambda: torch.amp.autocast(device_type=device.type, enabled=True)
         else:
-            autocast_ctx = contextlib.nullcontext()
+            scaler = torch.cuda.amp.GradScaler(enabled=True)
+            autocast_factory = lambda: torch.cuda.amp.autocast()
+    else:
+        scaler = None
+        autocast_factory = contextlib.nullcontext
 
     total_loss = 0.0
     total_samples = 0
@@ -133,6 +140,7 @@ def train_one_epoch(
     total_correct = 0
     dice_sum = 0.0
     dice_count = 0
+    num_batches = 0
 
     for step, raw_batch in enumerate(loader, start=1):
         batch = _prepare_batch(raw_batch, device)
@@ -140,13 +148,18 @@ def train_one_epoch(
         batch_size = images.size(0)
 
         optimizer.zero_grad(set_to_none=True)
-        with autocast_ctx:
+        with autocast_factory():
             logits = model({"image": images})
             loss = criterion(logits, masks)
 
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        if use_amp:
+            assert scaler is not None
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         preds = logits.argmax(dim=1)
         total_loss += loss.item() * batch_size
@@ -155,6 +168,7 @@ def train_one_epoch(
         total_pixels += masks.numel()
         dice_sum += _dice_score(preds, masks)
         dice_count += 1
+        num_batches += 1
 
         if max_steps > 0 and step >= max_steps:
             break
@@ -162,13 +176,19 @@ def train_one_epoch(
     avg_loss = total_loss / total_samples if total_samples else float("nan")
     pixel_acc = total_correct / total_pixels if total_pixels else 0.0
     avg_dice = dice_sum / dice_count if dice_count else 0.0
-    return {"loss": avg_loss, "pixel_acc": pixel_acc, "dice": avg_dice}
+    return {
+        "loss": avg_loss,
+        "pixel_acc": pixel_acc,
+        "dice": avg_dice,
+        "num_batches": num_batches,
+        "num_samples": total_samples,
+    }
 
 
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
-    loader: Iterable[Dict[str, torch.Tensor]],
+    loader: Iterable[Dict[str, object]],
     criterion: nn.Module,
     device: torch.device,
     max_steps: int,
@@ -180,6 +200,7 @@ def evaluate(
     total_correct = 0
     dice_sum = 0.0
     dice_count = 0
+    num_batches = 0
 
     for step, raw_batch in enumerate(loader, start=1):
         batch = _prepare_batch(raw_batch, device)
@@ -196,6 +217,7 @@ def evaluate(
         total_pixels += masks.numel()
         dice_sum += _dice_score(preds, masks)
         dice_count += 1
+        num_batches += 1
 
         if max_steps > 0 and step >= max_steps:
             break
@@ -203,7 +225,13 @@ def evaluate(
     avg_loss = total_loss / total_samples if total_samples else float("nan")
     pixel_acc = total_correct / total_pixels if total_pixels else 0.0
     avg_dice = dice_sum / dice_count if dice_count else 0.0
-    return {"loss": avg_loss, "pixel_acc": pixel_acc, "dice": avg_dice}
+    return {
+        "loss": avg_loss,
+        "pixel_acc": pixel_acc,
+        "dice": avg_dice,
+        "num_batches": num_batches,
+        "num_samples": total_samples,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -265,6 +293,7 @@ def main(argv: list[str] | None = None) -> int:
             f"train_loss={train_stats['loss']:.4f}",
             f"train_acc={train_stats['pixel_acc']:.3f}",
             f"train_dice={train_stats['dice']:.3f}",
+            f"train_batches={train_stats['num_batches']}",
         ]
         if val_stats is not None:
             log_parts.extend(
@@ -272,6 +301,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"val_loss={val_stats['loss']:.4f}",
                     f"val_acc={val_stats['pixel_acc']:.3f}",
                     f"val_dice={val_stats['dice']:.3f}",
+                    f"val_batches={val_stats['num_batches']}",
                 ]
             )
         print(" ".join(log_parts))
@@ -286,7 +316,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(
             f"[Validation] loss={final_val['loss']:.4f} "
-            f"acc={final_val['pixel_acc']:.3f} dice={final_val['dice']:.3f}"
+            f"acc={final_val['pixel_acc']:.3f} dice={final_val['dice']:.3f} "
+            f"batches={final_val['num_batches']}"
         )
 
     if "test" in loaders:
@@ -299,7 +330,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(
             f"[Test] loss={final_test['loss']:.4f} "
-            f"acc={final_test['pixel_acc']:.3f} dice={final_test['dice']:.3f}"
+            f"acc={final_test['pixel_acc']:.3f} dice={final_test['dice']:.3f} "
+            f"batches={final_test['num_batches']}"
         )
 
     return 0

@@ -1,201 +1,216 @@
-import os
 import re
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict
+from typing import Dict, List, Optional, Tuple
 
 import torch
-from torch.utils.data import Dataset, DataLoader, random_split
 from PIL import Image
+from torch.utils.data import DataLoader, Dataset, random_split
 import torchvision.transforms as T
-import matplotlib.pyplot as plt
 
 _ID_RE = re.compile(r"^(\d+)_")
 
-def _id_from_name(name: str) -> str:
-    """
-    Extract leading numeric ID before the first underscore.
-    Example: '21_manual1.gif' -> '21'
-             '21_training.tif' -> '21'
-    """
-    m = _ID_RE.match(name)
-    if not m:
-        raise ValueError(f"Could not parse ID from: {name}")
-    return m.group(1)
 
-class DriveSegmentation(Dataset):
+def _extract_id(filename: str) -> str:
+    match = _ID_RE.match(filename)
+    if not match:
+        raise ValueError(f"Cannot extract DRIVE sample id from '{filename}'")
+    return match.group(1)
+
+
+class DriveDataset(Dataset):
     """
-    DRIVE-style dataset where:
-      root/
-        training/
-          images/*.tif       (inputs)
-          1st_manual/*.gif   (binary masks)
+    Dataset wrapper for the DRIVE retinal vessel segmentation data.
+
+    Expected directory layout::
+
+        DRIVE/
+            training/
+                images/
+                1st_manual/
+                mask/             # field-of-view mask (optional during training)
+            test/
+                ...
     """
+
     def __init__(
         self,
         root: str,
-        split: str = "training",         # keep for future extensibility
+        split: str = "training",
         image_subdir: str = "images",
         mask_subdir: str = "1st_manual",
-        transform: Optional[T.Compose] = None,
-        mask_transform: Optional[T.Compose] = None,
-        binarize_threshold: float = 0.5,  # applied AFTER ToTensor (0..1)
-    ):
+        image_tfms: Optional[T.Compose] = None,
+        mask_tfms: Optional[T.Compose] = None,
+        binarize_threshold: float = 0.5,
+    ) -> None:
         super().__init__()
         self.root = Path(root)
         self.split = split
         self.image_dir = self.root / split / image_subdir
-        self.mask_dir  = self.root / split / mask_subdir
-        self.transform = transform
-        self.mask_transform = mask_transform
-        self.binarize_threshold = binarize_threshold
+        self.mask_dir = self.root / split / mask_subdir
 
         if not self.image_dir.is_dir():
-            raise FileNotFoundError(f"Images dir not found: {self.image_dir}")
+            raise FileNotFoundError(f"DriveDataset image directory missing: {self.image_dir}")
         if not self.mask_dir.is_dir():
-            raise FileNotFoundError(f"Masks dir not found: {self.mask_dir}")
+            raise FileNotFoundError(f"DriveDataset mask directory missing: {self.mask_dir}")
 
-        # Index images and masks by numeric ID
-        img_files = { _id_from_name(p.name): p for p in sorted(self.image_dir.glob("*.tif")) }
-        msk_files = { _id_from_name(p.name): p for p in sorted(self.mask_dir.glob("*.gif")) }
+        image_files = { _extract_id(p.name): p for p in sorted(self.image_dir.glob("*.tif")) }
+        mask_files = { _extract_id(p.name): p for p in sorted(self.mask_dir.glob("*.gif")) }
 
-        # Keep only IDs that appear in BOTH sets; warn on mismatches
-        common_ids = sorted(set(img_files.keys()) & set(msk_files.keys()), key=lambda x: int(x))
-        missing_imgs = sorted(set(msk_files.keys()) - set(img_files.keys()), key=lambda x: int(x))
-        missing_msks = sorted(set(img_files.keys()) - set(msk_files.keys()), key=lambda x: int(x))
+        common_ids = sorted(set(image_files) & set(mask_files), key=lambda x: int(x))
+        if not common_ids:
+            raise RuntimeError(f"No overlapping samples between images and masks under {self.split}")
 
-        if missing_imgs:
-            print(f"[DriveSegmentation] Warning: missing images for IDs: {missing_imgs}")
-        if missing_msks:
-            print(f"[DriveSegmentation] Warning: missing masks for IDs: {missing_msks}")
-
-        self.samples: List[Dict] = [
-            {"id": sid, "image_path": img_files[sid], "mask_path": msk_files[sid]}
-            for sid in common_ids
+        self.samples: List[Dict[str, Path]] = [
+             {"id": sid, "image_path": image_files[sid], "mask_path": mask_files[sid]}
+             for sid in common_ids
         ]
 
-        # Default transforms (simple + safe). You can replace with Albumentations if you prefer.
-        if self.transform is None:
-            self.transform = T.Compose([
-                T.ToTensor(),                         # -> [0,1], CxHxW
-                # Normalize if you like; DRIVE is not ImageNet, but this helps training stability.
+        self.image_tfms = image_tfms or T.Compose(
+            [
+                T.ToTensor(),
                 T.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-            ])
-        if self.mask_transform is None:
-            # For masks: to tensor only; no normalization. Will binarize afterwards.
-            self.mask_transform = T.Compose([
-                T.ToTensor(),                         # -> [0,1], 1xHxW
-            ])
+            ]
+        )
+        self.mask_tfms = mask_tfms or T.Compose(
+            [
+                T.ToTensor(),
+            ]
+        )
+        self.binarize_threshold = binarize_threshold
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         record = self.samples[idx]
-        img = Image.open(record["image_path"]).convert("RGB")
-        msk = Image.open(record["mask_path"]).convert("L")   # single-channel
+        image = Image.open(record["image_path"]).convert("RGB")
+        mask = Image.open(record["mask_path"]).convert("L")
 
-        img_t = self.transform(img) if self.transform else T.ToTensor()(img)
-        msk_t = self.mask_transform(msk) if self.mask_transform else T.ToTensor()(msk)
-
-        # binarize mask (handle masks saved with 0/255 or grayscale)
-        msk_t = (msk_t >= self.binarize_threshold).float()
+        image_tensor = self.image_tfms(image)
+        mask_tensor = self.mask_tfms(mask)
+        mask_tensor = (mask_tensor >= self.binarize_threshold).long().squeeze(0)
 
         return {
-            "image": img_t,            # FloatTensor [3,H,W], normalized
-            "mask": msk_t,             # FloatTensor [1,H,W], values {0.,1.}
-            "id": record["id"],
-            "image_path": str(record["image_path"]),
-            "mask_path": str(record["mask_path"]),
+            "image": image_tensor,
+            "mask": mask_tensor,
+            "meta": {
+                "id": record["id"],
+                "image_path": str(record["image_path"]),
+                "mask_path": str(record["mask_path"]),
+                "split": self.split,
+            },
         }
 
+
+def create_drive_dataloaders(
+    root: str,
+    batch_size: int = 4,
+    val_split: float = 0.2,
+    test_split: float = 0.0,
+    num_workers: int = 4,
+    seed: int = 42,
+    size: Optional[Tuple[int, int]] = None,
+    image_tfms: Optional[T.Compose] = None,
+    mask_tfms: Optional[T.Compose] = None,
+) -> Dict[str, DataLoader]:
+    if size is not None:
+        image_tfms = image_tfms or T.Compose(
+            [
+                T.Resize(size, interpolation=T.InterpolationMode.BILINEAR),
+                T.ToTensor(),
+                T.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+            ]
+        )
+        mask_tfms = mask_tfms or T.Compose(
+            [
+                T.Resize(size, interpolation=T.InterpolationMode.NEAREST),
+                T.ToTensor(),
+            ]
+        )
+
+    dataset = DriveDataset(
+        root=root,
+        split="training",
+        image_tfms=image_tfms,
+        mask_tfms=mask_tfms,
+    )
+
+    if not 0.0 <= val_split < 1.0:
+        raise ValueError("val_split must be in [0, 1).")
+    if not 0.0 <= test_split < 1.0:
+        raise ValueError("test_split must be in [0, 1).")
+    if val_split + test_split >= 1.0:
+        raise ValueError("val_split + test_split must sum to < 1.")
+
+    total = len(dataset)
+    val_len = int(round(total * val_split))
+    test_len = int(round(total * test_split))
+
+    if val_split > 0 and val_len == 0:
+        val_len = 1
+    if test_split > 0 and test_len == 0:
+        test_len = 1
+
+    train_len = total - val_len - test_len
+    if train_len <= 0:
+        raise ValueError("Splits leave no samples for training.")
+
+    lengths: List[int] = [train_len]
+    if val_len > 0:
+        lengths.append(val_len)
+    if test_len > 0:
+        lengths.append(test_len)
+
+    generator = torch.Generator().manual_seed(seed)
+    subsets = random_split(dataset, lengths, generator=generator)
+
+    idx = 0
+    train_dataset = subsets[idx]
+    idx += 1
+    val_dataset = subsets[idx] if val_len > 0 else None
+    idx += 1 if val_len > 0 else 0
+    test_dataset = subsets[idx] if test_len > 0 else None
+
+    def _make_loader(ds, shuffle: bool) -> DataLoader:
+        return DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+            drop_last=False,
+        )
+
+    loaders: Dict[str, DataLoader] = {"train": _make_loader(train_dataset, shuffle=True)}
+    if val_dataset is not None:
+        loaders["val"] = _make_loader(val_dataset, shuffle=False)
+    if test_dataset is not None:
+        loaders["test"] = _make_loader(test_dataset, shuffle=False)
+
+    return loaders
+
+
 def build_dataloaders(
-    drive_root: str,                      # path to the DRIVE root (folder that contains "training")
+    drive_root: str,
     batch_size: int = 4,
     num_workers: int = 4,
     val_ratio: float = 0.2,
     seed: int = 42,
     transform: Optional[T.Compose] = None,
     mask_transform: Optional[T.Compose] = None,
-) -> Tuple[DataLoader, DataLoader]:
-    """
-    Create train/val DataLoaders from the training split.
-    """
-    full_ds = DriveSegmentation(
+):
+    loaders = create_drive_dataloaders(
         root=drive_root,
-        split="training",
-        transform=transform,
-        mask_transform=mask_transform,
-    )
-
-    # Split reproducibly
-    n_total = len(full_ds)
-    n_val = int(round(n_total * val_ratio))
-    n_train = n_total - n_val
-    gen = torch.Generator().manual_seed(seed)
-    train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=gen)
-
-    train_loader = DataLoader(
-        train_ds,
         batch_size=batch_size,
-        shuffle=True,
+        val_split=val_ratio,
+        test_split=0.0,
         num_workers=num_workers,
-        pin_memory=True,
-        drop_last=False,
+        seed=seed,
+        size=None,
+        image_tfms=transform,
+        mask_tfms=mask_transform,
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
-    return train_loader, val_loader
+    return loaders["train"], loaders["val"]
 
 
-if __name__ == "__main__":
-    # Point to the folder that contains `training/`
-    drive_root = r"C:\Users\lucas\PycharmProjects\02516_Assignment_03\data\DRIVE"
-
-    # Optional: add resizing/augmentations
-    img_aug = T.Compose([
-        T.Resize((256, 256)),
-        T.ColorJitter(0.1, 0.1, 0.1, 0.05),
-        T.ToTensor(),
-        T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
-    mask_aug = T.Compose([
-        T.Resize((256, 256), interpolation=T.InterpolationMode.NEAREST),
-        T.ToTensor(),
-    ])
-
-    train_loader, val_loader = build_dataloaders(
-        drive_root,
-        batch_size=4,
-        num_workers=2,
-        val_ratio=0.2,
-        transform=img_aug,
-        mask_transform=mask_aug,
-    )
-
-    # Iterate
-    for batch in train_loader:
-        images = batch["image"]  # [B,3,H,W]
-        masks = batch["mask"]  # [B,1,H,W]
-        ids = batch["id"]
-        print(images.shape, masks.shape, ids)
-        # plot images
-        plt.figure(figsize=(10, 5))
-        for i in range(4):
-            plt.subplot(2, 4, i+1)
-            plt.imshow(images[i].permute(1, 2, 0))
-            plt.title(f"Image {ids[i]}")
-            plt.axis('off')
-            plt.subplot(2, 4, i+5)
-            plt.imshow(masks[i, 0], cmap='gray')
-            plt.title(f"Mask {ids[i]}")
-            plt.axis('off')
-
-        plt.tight_layout()
-        plt.show()
-        break
+__all__ = ["DriveDataset", "create_drive_dataloaders", "build_dataloaders"]

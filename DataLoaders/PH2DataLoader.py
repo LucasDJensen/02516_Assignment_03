@@ -1,238 +1,244 @@
 import os
 from glob import glob
-from typing import Callable, Optional, Tuple, List, Literal
+from typing import Dict, List, Literal, Optional, Tuple
 
 import torch
-from torch.utils.data import Dataset, DataLoader, random_split
 from PIL import Image
+from torch.utils.data import DataLoader, Dataset, random_split
 import torchvision.transforms as T
-
-import matplotlib.pyplot as plt
 
 
 class PH2Dataset(Dataset):
     """
-    PH2 dataset loader.
+    Dataset loader for PH2 skin lesion segmentation.
 
-    Root structure (per your screenshot):
-    PH2_Dataset_images/
-      IMD002/
-        IMD002_Dermoscopic_Image/IMD002.bmp
-        IMD002_lesion/IMD002_lesion.bmp
-        IMD002_roi/IMD002_R1_Label4.bmp (sometimes also *_R2_*.bmp)
-      IMD003/
-        ...
+    Expected directory layout::
 
-    Args:
-        root: path to 'PH2_Dataset_images'
-        target: which mask to return: 'lesion', 'roi', or 'both'
-        image_tfms: torchvision transform applied to the image (after resize)
-        mask_tfms:  torchvision transform applied to mask(s) (after resize)
-        size: optional (w, h) to resize image & mask(s) to; if None, keep original size
-        roi_preference: if multiple ROI masks exist, choose 'R1' first or 'largest'
-                        ('R1' | 'largest')
-        return_paths: if True, also returns (img_path, mask_path_or_tuple)
+        PH2_Dataset_images/
+            IMD002/
+                IMD002_Dermoscopic_Image/IMD002.bmp
+                IMD002_lesion/IMD002_lesion.bmp
+                IMD002_roi/IMD002_R1_Label4.bmp
+            IMD003/
+                ...
     """
 
     def __init__(
-            self,
-            root: str,
-            target: Literal["lesion", "roi", "both"] = "lesion",
-            image_tfms: Optional[Callable] = None,
-            mask_tfms: Optional[Callable] = None,
-            size: Optional[Tuple[int, int]] = (256, 256),
-            roi_preference: Literal["R1", "largest"] = "R1",
-            return_paths: bool = False,
+        self,
+        root: str,
+        target: Literal["lesion", "roi"] = "lesion",
+        image_tfms: Optional[T.Compose] = None,
+        mask_tfms: Optional[T.Compose] = None,
+        size: Optional[Tuple[int, int]] = (256, 256),
+        roi_preference: Literal["R1", "largest"] = "R1",
     ) -> None:
         super().__init__()
-        self.root = root
+        if target not in {"lesion", "roi"}:
+            raise ValueError("PH2Dataset currently supports 'lesion' or 'roi' targets.")
+
+        self.root = os.path.abspath(root)
         self.target = target
-        self.image_tfms = image_tfms
-        self.mask_tfms = mask_tfms
         self.size = size
         self.roi_preference = roi_preference
-        self.return_paths = return_paths
+        self.image_tfms = image_tfms
+        self.mask_tfms = mask_tfms
 
         self.items = self._index_cases()
 
-        # default basic transforms (only if user didn't pass any)
         if self.image_tfms is None:
-            tfms = []
+            img_tfms = []
             if size is not None:
-                tfms.append(T.Resize(size, interpolation=T.InterpolationMode.BILINEAR))
-            tfms += [T.ToTensor()]  # 0..1 float, CxHxW
-            self.image_tfms = T.Compose(tfms)
+                img_tfms.append(T.Resize(size, interpolation=T.InterpolationMode.BILINEAR))
+            img_tfms.append(T.ToTensor())
+            self.image_tfms = T.Compose(img_tfms)
 
         if self.mask_tfms is None:
-            m_tfms = []
+            mask_tfms = []
             if size is not None:
-                m_tfms.append(T.Resize(size, interpolation=T.InterpolationMode.NEAREST))
-            # convert to tensor without normalization; keep single channel
-            m_tfms += [T.PILToTensor()]  # uint8, 1xHxW
-            self.mask_tfms = T.Compose(m_tfms)
+                mask_tfms.append(T.Resize(size, interpolation=T.InterpolationMode.NEAREST))
+            mask_tfms.append(T.PILToTensor())
+            self.mask_tfms = T.Compose(mask_tfms)
 
-    def _index_cases(self) -> List[dict]:
-        cases = []
-        for case_dir in sorted(next(os.walk(self.root))[1]):  # IMDxxx folders
-            croot = os.path.join(self.root, case_dir)
+    def _index_cases(self) -> List[Dict[str, Optional[str]]]:
+        cases: List[Dict[str, Optional[str]]] = []
+        entries = next(os.walk(self.root))[1]
 
-            # image
-            img_dir = glob(os.path.join(croot, f"{case_dir}_Dermoscopic_Image"))[0]
-            img_paths = glob(os.path.join(img_dir, "*.bmp"))
-            if not img_paths:
+        for case_dir in sorted(entries):
+            case_root = os.path.join(self.root, case_dir)
+
+            img_dir = os.path.join(case_root, f"{case_dir}_Dermoscopic_Image")
+            img_candidates = glob(os.path.join(img_dir, "*.bmp"))
+            if not img_candidates:
                 continue
-            img_path = img_paths[0]
+            image_path = img_candidates[0]
 
-            # lesion mask
-            lesion_dir = os.path.join(croot, f"{case_dir}_lesion")
-            lesion_path = None
-            cand = glob(os.path.join(lesion_dir, f"{case_dir}_lesion.bmp"))
-            if cand:
-                lesion_path = cand[0]
+            lesion_path: Optional[str] = None
+            lesion_dir = os.path.join(case_root, f"{case_dir}_lesion")
+            lesion_candidates = glob(os.path.join(lesion_dir, f"{case_dir}_lesion.bmp"))
+            if lesion_candidates:
+                lesion_path = lesion_candidates[0]
 
-            # roi mask(s)
-            roi_dir = os.path.join(croot, f"{case_dir}_roi")
-            roi_paths = sorted(glob(os.path.join(roi_dir, f"{case_dir}_R*_Label*.bmp")))
-            roi_path = None
-            if roi_paths:
+            roi_path: Optional[str] = None
+            roi_dir = os.path.join(case_root, f"{case_dir}_roi")
+            roi_candidates = sorted(glob(os.path.join(roi_dir, f"{case_dir}_R*_Label*.bmp")))
+            if roi_candidates:
                 if self.roi_preference == "R1":
-                    # pick an R1 if present, else fall back to first
-                    r1 = [p for p in roi_paths if os.path.basename(p).startswith(f"{case_dir}_R1")]
-                    roi_path = r1[0] if r1 else roi_paths[0]
-                else:  # largest area heuristic
-                    roi_path = max(roi_paths, key=lambda p: Image.open(p).size[0] * Image.open(p).size[1])
+                    r1_candidates = [
+                        candidate for candidate in roi_candidates if os.path.basename(candidate).startswith(f"{case_dir}_R1")
+                    ]
+                    roi_path = r1_candidates[0] if r1_candidates else roi_candidates[0]
+                else:
+                    roi_path = max(
+                        roi_candidates,
+                        key=lambda candidate: Image.open(candidate).size[0] * Image.open(candidate).size[1],
+                    )
 
             cases.append(
                 {
                     "case": case_dir,
-                    "image": img_path,
+                    "image": image_path,
                     "lesion": lesion_path,
                     "roi": roi_path,
                 }
             )
+
         if not cases:
-            raise RuntimeError(f"No cases found under {self.root}")
+            raise RuntimeError(f"No PH2 cases found under {self.root}")
         return cases
 
     def __len__(self) -> int:
         return len(self.items)
 
     @staticmethod
-    def _img_to_rgb(img_path: str) -> Image.Image:
-        img = Image.open(img_path)
+    def _load_rgb(path: str) -> Image.Image:
+        img = Image.open(path)
         if img.mode != "RGB":
             img = img.convert("RGB")
         return img
 
-    def __getitem__(self, idx: int):
-        item = self.items[idx]
-        img = self._img_to_rgb(item["image"])
-        img = self.image_tfms(img)  # float [0..1], 3xHxW
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        entry = self.items[idx]
+        img = self._load_rgb(entry["image"])
+        mask_path = entry[self.target]
+        if mask_path is None:
+            raise FileNotFoundError(f"Mask not found for case {entry['case']} (target={self.target}).")
 
-        m = Image.open(item["lesion"]).convert("L")
-        m = self.mask_tfms(m)  # uint8, 1xHxW
-        lesion_t = (m > 0).float()  # binary mask {0,1}
+        mask_img = Image.open(mask_path).convert("L")
+
+        image_tensor = self.image_tfms(img)
+        mask_tensor = self.mask_tfms(mask_img)
+        # Convert mask to integer labels {0,1}
+        mask_tensor = (mask_tensor > 0).long().squeeze(0)
 
         return {
-            "image": img,
-            "mask": lesion_t,
-            "id": item["case"],
-            "image_path": item["image"],
-            "mask_path": item["lesion"],
+            "image": image_tensor,
+            "mask": mask_tensor,
+            "meta": {
+                "case": entry["case"],
+                "image_path": entry["image"],
+                "mask_path": mask_path,
+                "target": self.target,
+            },
         }
 
 
-def build_dataloaders(
-        root: str,  # path to the DRIVE root (folder that contains "training")
-        batch_size: int = 4,
-        num_workers: int = 4,
-        val_ratio: float = 0.2,
-        seed: int = 42,
-        transform: Optional[T.Compose] = None,
-        mask_transform: Optional[T.Compose] = None,
-) -> Tuple[DataLoader, DataLoader]:
-    """
-    Create train/val DataLoaders from the training split.
-    """
-    full_ds = PH2Dataset(
+def create_ph2_dataloaders(
+    root: str,
+    batch_size: int = 4,
+    val_split: float = 0.2,
+    test_split: float = 0.0,
+    num_workers: int = 4,
+    seed: int = 42,
+    size: Optional[Tuple[int, int]] = (256, 256),
+    target: Literal["lesion", "roi"] = "lesion",
+    image_tfms: Optional[T.Compose] = None,
+    mask_tfms: Optional[T.Compose] = None,
+) -> Dict[str, DataLoader]:
+    dataset = PH2Dataset(
         root=root,
-        target="lesion",  # 'lesion' | 'roi' | 'both'
-        image_tfms=transform,  # or None to use defaults
-        mask_tfms=mask_transform,  # or None to use defaults
-        size=None,  # if you rely entirely on the custom transforms above
-        roi_preference="R1",  # or "largest"
-        return_paths=False
+        target=target,
+        image_tfms=image_tfms,
+        mask_tfms=mask_tfms,
+        size=size,
     )
 
-    # Split reproducibly
-    n_total = len(full_ds)
-    n_val = int(round(n_total * val_ratio))
-    n_train = n_total - n_val
-    gen = torch.Generator().manual_seed(seed)
-    train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=gen)
+    if not 0.0 <= val_split < 1.0:
+        raise ValueError("val_split must be in [0, 1).")
+    if not 0.0 <= test_split < 1.0:
+        raise ValueError("test_split must be in [0, 1).")
+    if val_split + test_split >= 1.0:
+        raise ValueError("val_split + test_split must sum to < 1.")
 
-    train_loader = DataLoader(
-        train_ds,
+    total = len(dataset)
+    val_len = int(round(total * val_split))
+    test_len = int(round(total * test_split))
+
+    if val_split > 0 and val_len == 0:
+        val_len = 1
+    if test_split > 0 and test_len == 0:
+        test_len = 1
+
+    train_len = total - val_len - test_len
+    if train_len <= 0:
+        raise ValueError("Splits leave no samples for training.")
+
+    lengths: List[int] = [train_len]
+    if val_len > 0:
+        lengths.append(val_len)
+    if test_len > 0:
+        lengths.append(test_len)
+
+    generator = torch.Generator().manual_seed(seed)
+    subsets = random_split(dataset, lengths, generator=generator)
+
+    idx = 0
+    train_dataset = subsets[idx]
+    idx += 1
+    val_dataset = subsets[idx] if val_len > 0 else None
+    idx += 1 if val_len > 0 else 0
+    test_dataset = subsets[idx] if test_len > 0 else None
+
+    def _make_loader(ds, shuffle: bool) -> DataLoader:
+        return DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+            drop_last=False,
+        )
+
+    loaders: Dict[str, DataLoader] = {"train": _make_loader(train_dataset, shuffle=True)}
+    if val_dataset is not None:
+        loaders["val"] = _make_loader(val_dataset, shuffle=False)
+    if test_dataset is not None:
+        loaders["test"] = _make_loader(test_dataset, shuffle=False)
+
+    return loaders
+
+
+def build_dataloaders(
+    root: str,
+    batch_size: int = 4,
+    num_workers: int = 4,
+    val_ratio: float = 0.2,
+    seed: int = 42,
+    transform: Optional[T.Compose] = None,
+    mask_transform: Optional[T.Compose] = None,
+):
+    loaders = create_ph2_dataloaders(
+        root=root,
         batch_size=batch_size,
-        shuffle=True,
+        val_split=val_ratio,
+        test_split=0.0,
         num_workers=num_workers,
-        pin_memory=True,
-        drop_last=False,
+        seed=seed,
+        size=None,
+        target="lesion",
+        image_tfms=transform,
+        mask_tfms=mask_transform,
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
-    return train_loader, val_loader
+    return loaders["train"], loaders["val"]
 
 
-# ---------- Example usage ----------
-
-if __name__ == "__main__":
-    data_root = r"C:\Users\lucas\PycharmProjects\02516_Assignment_03\data\PH2_Dataset_images"  # <- change to your path
-
-    # Optional: add augmentations on top of the defaults
-    image_tfms = T.Compose([
-        T.Resize((384, 384), interpolation=T.InterpolationMode.BILINEAR),
-        T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05, hue=0.02),
-        T.ToTensor(),
-    ])
-    mask_tfms = T.Compose([
-        T.Resize((384, 384), interpolation=T.InterpolationMode.NEAREST),
-        T.PILToTensor()
-    ])
-
-    train_loader, val_loader = build_dataloaders(
-        data_root,
-        batch_size=4,
-        num_workers=2,
-        val_ratio=0.2,
-        transform=image_tfms,
-        mask_transform=mask_tfms,
-    )
-
-    # Iterate
-    for batch in train_loader:
-        images = batch["image"]  # [B,3,H,W]
-        masks = batch["mask"]  # [B,1,H,W]
-        ids = batch["id"]
-        print(images.shape, masks.shape, ids)
-        # plot images
-        plt.figure(figsize=(10, 5))
-        for i in range(4):
-            plt.subplot(2, 4, i + 1)
-            plt.imshow(images[i].permute(1, 2, 0))
-            plt.title(f"Image {ids[i]}")
-            plt.axis('off')
-            plt.subplot(2, 4, i + 5)
-            plt.imshow(masks[i, 0], cmap='gray')
-            plt.title(f"Mask {ids[i]}")
-            plt.axis('off')
-
-        plt.tight_layout()
-        plt.show()
-        break
+__all__ = ["PH2Dataset", "create_ph2_dataloaders", "build_dataloaders"]

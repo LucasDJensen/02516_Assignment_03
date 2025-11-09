@@ -55,6 +55,9 @@ class UNet(nn.Module):
         self.final = nn.Conv2d(base_c, out_channels, kernel_size=1)
 
     def forward(self, x):
+        if isinstance(x, dict):
+            x = x["image"]
+
         skips = []
         for down, pool in zip(self.downs, self.pools):
             x = down(x)
@@ -75,3 +78,18 @@ class UNet(nn.Module):
             x = up_conv(x)
 
         return self.final(x)  # logits
+
+
+def create_unet(
+    num_classes: int = 2,
+    in_channels: int = 3,
+    base_channels: int = 64,
+    depth: int = 4,
+) -> UNet:
+    """
+    Helper to instantiate UNet with configurable number of classes.
+    """
+    return UNet(in_channels=in_channels, out_channels=num_classes, base_c=base_channels, depth=depth)
+
+
+__all__ = ["UNet", "create_unet"]

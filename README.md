@@ -35,3 +35,8 @@ uv sync
 ```bash
 uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ``` 
+
+
+```bash
+bsub -app c02516_1g.10gb < run_hpc_drive_fcn.sh
+``` 

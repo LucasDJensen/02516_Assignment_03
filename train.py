@@ -7,6 +7,9 @@ ready for GPU execution on the DTU HPC cluster (paths default to /dtu/datasets1/
 """
 
 from dotenv import load_dotenv
+
+from losses import *
+
 load_dotenv()
 
 import argparse
@@ -15,8 +18,7 @@ import math
 import os
 import sys
 from datetime import datetime
-from typing import Dict, Iterable
-
+from typing import Dict, Iterable, Callable
 
 import contextlib
 
@@ -42,6 +44,13 @@ _DEFAULT_DATA_ROOTS = {
     "drive": os.environ.get("DRIVE_ROOT", "dtu/datasets1/02516/DRIVE"),
 }
 
+LOSS_REGISTRY: Dict[str, Callable[[], nn.Module]] = {
+    "bce": BCELoss,
+    "dice": DiceLoss,
+    "focal": FocalLoss,
+    "bce_tv": BCELoss_TotalVariation,
+    "ce": nn.CrossEntropyLoss
+}
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a segmentation model.")
@@ -63,6 +72,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--artifact-dir",
         default="artifacts",
         help="Directory for saving training curves/metrics (set empty string to disable).",
+    )
+
+    parser.add_argument(
+        "--loss",
+        type=str,
+        default="bce",
+        choices=tuple(LOSS_REGISTRY.keys()),
+        help="Loss function to optimize.",
     )
     return parser.parse_args(argv)
 
@@ -173,17 +190,34 @@ def _plot_metric(ax, epochs: list[int], train_vals: list[float | None], val_vals
     ax.legend()
 
 
-def _plot_training_curves(history: list[Dict[str, object]], artifact_dir: str) -> str:
+def _plot_training_curves(history: list[Dict[str, object]], artifact_dir: str, loss:str) -> str:
     epochs = [entry.get("epoch") for entry in history]
-    train_loss = _extract_metric(history, "train", "loss")
-    val_loss = _extract_metric(history, "val", "loss")
-    train_acc = _extract_metric(history, "train", "pixel_acc")
-    val_acc = _extract_metric(history, "val", "pixel_acc")
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    _plot_metric(axes[0], epochs, train_loss, val_loss, "Loss", "Cross-Entropy Loss")
-    _plot_metric(axes[1], epochs, train_acc, val_acc, "Pixel Accuracy", "Pixel Accuracy")
-    fig.tight_layout()
+    # (metric_key, y_label, title)
+    metrics = [
+        ("loss", "Loss", loss),
+        ("pixel_acc", "Pixel Accuracy", "Pixel Accuracy"),
+        ("dice", "Dice", "Dice (F1)"),
+        ("iou", "IoU", "Intersection over Union"),
+        ("sensitivity", "Sensitivity", "Sensitivity (Recall/TPR)"),
+        ("specificity", "Specificity", "Specificity (TNR)"),
+    ]
+
+    rows, cols = 2, 3
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 6, rows * 4))
+    axes = axes.ravel()
+
+    for ax, (key, ylabel, title) in zip(axes, metrics):
+        train_vals = _extract_metric(history, "train", key)
+        val_vals = _extract_metric(history, "val", key)
+        _plot_metric(ax, epochs, train_vals, val_vals, ylabel, title)
+
+    # If there are more axes than metrics (future-proof), hide extras
+    for ax in axes[len(metrics):]:
+        ax.set_visible(False)
+
+    fig.suptitle("Training & Validation Curves", fontsize=14)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
 
     figure_path = os.path.join(artifact_dir, "training_curves.png")
     fig.savefig(figure_path, dpi=200)
@@ -514,7 +548,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     optimizer = Adam(model.parameters(), lr=args.learning_rate)
-    criterion = nn.CrossEntropyLoss()
+    criterion = LOSS_REGISTRY[args.loss]()
     history: list[Dict[str, object]] = []
     best_val_metric = -float("inf")
     best_checkpoint_path: str | None = None
@@ -575,7 +609,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if artifact_dir and history:
         history_path = _save_history(history, artifact_dir)
-        curves_path = _plot_training_curves(history, artifact_dir)
+        curves_path = _plot_training_curves(history, artifact_dir, args.loss)
         print(f"[Artifacts] metrics={history_path} curves={curves_path}")
         last_checkpoint_path = _save_checkpoint(model, artifact_dir, "last_model.pt")
         info = f"[Checkpoint] last={last_checkpoint_path}"

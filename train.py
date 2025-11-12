@@ -6,7 +6,8 @@ U-Net implementation (placeholder). Uses the PH2 dataloader by default and is
 ready for GPU execution on the DTU HPC cluster (paths default to /dtu/datasets1/02516).
 """
 
-from __future__ import annotations
+from dotenv import load_dotenv
+load_dotenv()
 
 import argparse
 import json
@@ -15,6 +16,7 @@ import os
 import sys
 from datetime import datetime
 from typing import Dict, Iterable
+
 
 import contextlib
 
@@ -337,6 +339,12 @@ def train_one_epoch(
     dice_sum = 0.0
     dice_count = 0
     num_batches = 0
+    # Confusion matrix components for binary segmentation (positive class = 1)
+    tp = 0
+    tn = 0
+    fp = 0
+    fn = 0
+    eps = 1e-6
 
     for step, raw_batch in enumerate(loader, start=1):
         batch = _prepare_batch(raw_batch, device)
@@ -366,16 +374,32 @@ def train_one_epoch(
         dice_count += 1
         num_batches += 1
 
+        # Update confusion matrix for binary metrics
+        pred_fg = (preds == 1)
+        true_fg = (masks == 1)
+        pred_bg = ~pred_fg
+        true_bg = ~true_fg
+        tp += (pred_fg & true_fg).sum().item()
+        tn += (pred_bg & true_bg).sum().item()
+        fp += (pred_fg & true_bg).sum().item()
+        fn += (pred_bg & true_fg).sum().item()
+
         if max_steps > 0 and step >= max_steps:
             break
 
     avg_loss = total_loss / total_samples if total_samples else float("nan")
     pixel_acc = total_correct / total_pixels if total_pixels else 0.0
     avg_dice = dice_sum / dice_count if dice_count else 0.0
+    iou = tp / (tp + fp + fn + eps)
+    sensitivity = tp / (tp + fn + eps)  # Recall / TPR
+    specificity = tn / (tn + fp + eps)  # TNR
     return {
         "loss": avg_loss,
         "pixel_acc": pixel_acc,
         "dice": avg_dice,
+        "iou": iou,
+        "sensitivity": sensitivity,
+        "specificity": specificity,
         "num_batches": num_batches,
         "num_samples": total_samples,
     }
@@ -397,6 +421,12 @@ def evaluate(
     dice_sum = 0.0
     dice_count = 0
     num_batches = 0
+    # Confusion matrix components for binary segmentation (positive class = 1)
+    tp = 0
+    tn = 0
+    fp = 0
+    fn = 0
+    eps = 1e-6
 
     for step, raw_batch in enumerate(loader, start=1):
         batch = _prepare_batch(raw_batch, device)
@@ -415,16 +445,32 @@ def evaluate(
         dice_count += 1
         num_batches += 1
 
+        # Update confusion matrix for binary metrics
+        pred_fg = (preds == 1)
+        true_fg = (masks == 1)
+        pred_bg = ~pred_fg
+        true_bg = ~true_fg
+        tp += (pred_fg & true_fg).sum().item()
+        tn += (pred_bg & true_bg).sum().item()
+        fp += (pred_fg & true_bg).sum().item()
+        fn += (pred_bg & true_fg).sum().item()
+
         if max_steps > 0 and step >= max_steps:
             break
 
     avg_loss = total_loss / total_samples if total_samples else float("nan")
     pixel_acc = total_correct / total_pixels if total_pixels else 0.0
     avg_dice = dice_sum / dice_count if dice_count else 0.0
+    iou = tp / (tp + fp + fn + eps)
+    sensitivity = tp / (tp + fn + eps)
+    specificity = tn / (tn + fp + eps)
     return {
         "loss": avg_loss,
         "pixel_acc": pixel_acc,
         "dice": avg_dice,
+        "iou": iou,
+        "sensitivity": sensitivity,
+        "specificity": specificity,
         "num_batches": num_batches,
         "num_samples": total_samples,
     }
@@ -498,6 +544,9 @@ def main(argv: list[str] | None = None) -> int:
             f"train_loss={train_stats['loss']:.4f}",
             f"train_acc={train_stats['pixel_acc']:.3f}",
             f"train_dice={train_stats['dice']:.3f}",
+            f"train_iou={train_stats.get('iou', float('nan')):.3f}",
+            f"train_sens={train_stats.get('sensitivity', float('nan')):.3f}",
+            f"train_spec={train_stats.get('specificity', float('nan')):.3f}",
             f"train_batches={train_stats['num_batches']}",
         ]
         if val_stats is not None:
@@ -506,6 +555,9 @@ def main(argv: list[str] | None = None) -> int:
                     f"val_loss={val_stats['loss']:.4f}",
                     f"val_acc={val_stats['pixel_acc']:.3f}",
                     f"val_dice={val_stats['dice']:.3f}",
+                    f"val_iou={val_stats.get('iou', float('nan')):.3f}",
+                    f"val_sens={val_stats.get('sensitivity', float('nan')):.3f}",
+                    f"val_spec={val_stats.get('specificity', float('nan')):.3f}",
                     f"val_batches={val_stats['num_batches']}",
                 ]
             )
@@ -542,6 +594,9 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"[Validation] loss={final_val['loss']:.4f} "
             f"acc={final_val['pixel_acc']:.3f} dice={final_val['dice']:.3f} "
+            f"iou={final_val.get('iou', float('nan')):.3f} "
+            f"sens={final_val.get('sensitivity', float('nan')):.3f} "
+            f"spec={final_val.get('specificity', float('nan')):.3f} "
             f"batches={final_val['num_batches']}"
         )
         val_sample_paths = _save_prediction_samples(model, loaders["val"], device, artifact_dir, "val")
@@ -559,6 +614,9 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"[Test] loss={final_test['loss']:.4f} "
             f"acc={final_test['pixel_acc']:.3f} dice={final_test['dice']:.3f} "
+            f"iou={final_test.get('iou', float('nan')):.3f} "
+            f"sens={final_test.get('sensitivity', float('nan')):.3f} "
+            f"spec={final_test.get('specificity', float('nan')):.3f} "
             f"batches={final_test['num_batches']}"
         )
         test_sample_paths = _save_prediction_samples(model, loaders["test"], device, artifact_dir, "test")

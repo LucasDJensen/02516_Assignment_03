@@ -26,3 +26,12 @@ python train.py \
 ```
 
 If you're testing locally without the dataset mounted, the script will exit early and prompt you to point `--data-root` to an accessible copy.
+
+
+
+```bash
+uv sync
+``` 
+```bash
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+``` 
